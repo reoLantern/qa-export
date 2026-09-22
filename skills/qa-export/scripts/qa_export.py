@@ -146,14 +146,17 @@ class ClaudeBackend:
             isinstance(b, dict) and b.get("type") == "tool_result" for b in content
         )
 
-    def parse(self, path, keep_sidechain=False, all_branches=False):
+    def parse(self, path, all_branches=False):
         """按 Esc 改写重发的提问，jsonl 里留下两条 parentUuid 相同、中间没有
-        任何回答的记录，默认只保留后发的那条。"""
+        任何回答的记录，默认只保留后发的那条。
+
+        子 agent（sidechain）的对话一律不导出：本工具归档的是人与 agent 的
+        问答，不是 agent 内部的协作过程。"""
         turns = []
         for d in read_jsonl(path):
             if d.get("type") not in ("user", "assistant") or d.get("isMeta"):
                 continue
-            if d.get("isSidechain") and not keep_sidechain:
+            if d.get("isSidechain"):
                 continue
             if d.get("isCompactSummary"):
                 continue  # /compact 之后自动注入的摘要，不是用户说的话
@@ -230,7 +233,7 @@ class CodexBackend:
             if isinstance(b, dict) and b.get("type") in kinds
         )
 
-    def parse(self, path, keep_sidechain=False, all_branches=False):
+    def parse(self, path, all_branches=False):
         """Codex 没有分支树；重发/改写表现为「上一条没等到回答，且是本条的前缀」。"""
         turns = []
         for d in read_jsonl(path):
@@ -398,7 +401,6 @@ def main():
     ap.add_argument("-C", "--cwd", default=os.getcwd(), metavar="DIR", help="项目目录，默认当前目录")
     ap.add_argument("-a", "--agent", choices=["auto", "claude", "codex"], default="auto",
                     help="从哪个 agent 的记录里取，默认自动判断")
-    ap.add_argument("--sidechain", action="store_true", help="包含子 agent 的对话")
     ap.add_argument("--all-branches", action="store_true", help="保留被改写重发废弃的旧提问")
     ap.add_argument("--from", dest="from_", metavar="TEXT",
                     help="从提到 TEXT 的那一轮开始，一直到最后（或 --to 指定的那轮）")
@@ -428,7 +430,7 @@ def main():
             found = True
             print(f"\n== {be.label} ==")
             for path, mtime, sid in rows[:20]:
-                n = len(be.parse(path, args.sidechain, args.all_branches))
+                n = len(be.parse(path, args.all_branches))
                 stamp = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
                 print(f"  {str(sid)[:8]}  {stamp}  {n:3d} 轮  {os.path.basename(path)}")
         if not found:
@@ -436,7 +438,7 @@ def main():
         return
 
     be, path, sid = resolve(args.cwd, args.agent, args.session)
-    turns = be.parse(path, args.sidechain, args.all_branches)
+    turns = be.parse(path, args.all_branches)
     if not turns:
         sys.exit(f"{path} 里没有解析出问答")
 

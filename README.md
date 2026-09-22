@@ -2,6 +2,8 @@
 
 把编码 agent 的问答**原样**导出成 Markdown。
 
+归档范围是**人与 agent 的主线问答**——子 agent 之间的协作过程不导出。
+
 问答全文本来就落在本地磁盘上，没必要让模型再复述一遍——那样既费 token，内容还会走样。
 这个 skill 直接解析会话记录文件，逐字取出提问和回答。
 
@@ -36,7 +38,9 @@ python3 skills/qa-export/scripts/qa_export.py -n 2 -o QA.md
 
 ```
 qa_export.py [-l] [--sessions] [-n N] [-t SPEC] [-o FILE] [-s ID]
-             [-a claude|codex] [-C DIR] [--no-answer] [--sidechain] [--all-branches]
+             [-C DIR] [-a {auto,claude,codex}] [--all-branches]
+             [--from TEXT] [--to TEXT] [-g TEXT] [--match-answers]
+             [--dry-run] [--include-pending] [--tail N] [--no-answer]
 ```
 
 | 选项 | 作用 |
@@ -57,7 +61,6 @@ qa_export.py [-l] [--sessions] [-n N] [-t SPEC] [-o FILE] [-s ID]
 | `--include-pending` | 不排除当前进行中的那一轮 |
 | `--tail N` | `-l` 只显示最近 N 轮，0 为全部（默认 20） |
 | `--no-answer` | 只导出提问 |
-| `--sidechain` | 包含子 agent 的对话 |
 | `--all-branches` | 保留被改写重发时废弃的旧提问 |
 
 输出形如：
