@@ -25,8 +25,9 @@ NOISE = re.compile(
     r"<local-command-caveat>.*?</local-command-caveat>",
     re.S,
 )
-# 斜杠命令的回显，不是提问
-CLAUDE_SKIP_PREFIX = ("<command-name>", "<command-message>", "<local-command-stdout>")
+# 斜杠命令的回显和打断标记，不是提问
+CLAUDE_SKIP_PREFIX = ("<command-name>", "<command-message>", "<local-command-stdout>",
+                      "[Request interrupted by user")
 # Codex 以 user 角色注入、但不是用户说的话：每轮的环境信封，和 AGENTS.md 正文
 CODEX_ENVELOPE = re.compile(
     r"^<(environment_context|user_instructions|recommended_plugins|model_switch"
@@ -209,7 +210,7 @@ class CodexBackend:
         return None
 
     def current_id(self):
-        return None  # Codex 不往环境里写会话 id
+        return os.environ.get("CODEX_SESSION_ID")
 
     @staticmethod
     def _text(content, kinds):
@@ -362,6 +363,12 @@ def main():
                     help="从哪个 agent 的记录里取，默认自动判断")
     ap.add_argument("--sidechain", action="store_true", help="包含子 agent 的对话")
     ap.add_argument("--all-branches", action="store_true", help="保留被改写重发废弃的旧提问")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只报告会导出哪几轮，不写文件（确认用，输出很短）")
+    ap.add_argument("--include-pending", action="store_true",
+                    help="不排除当前正在进行的那一轮")
+    ap.add_argument("--tail", type=int, default=20, metavar="N",
+                    help="-l 只显示最近 N 轮，0 表示全部（默认 20）")
     ap.add_argument("--no-answer", action="store_true", help="只导出提问")
     args = ap.parse_args()
 
@@ -389,13 +396,18 @@ def main():
         sys.exit(f"{path} 里没有解析出问答")
 
     if args.list or (args.last is None and not args.turns):
-        print(f"# [{be.label}] {path}  ({len(turns)} 轮)\n", file=sys.stderr)
-        for i, t in enumerate(turns, 1):
+        n = len(turns)
+        start = max(0, n - args.tail) if args.tail > 0 else 0
+        print(f"# [{be.label}] {path}  （共 {n} 轮）", file=sys.stderr)
+        if start:
+            print(f"# 只显示最近 {args.tail} 轮，--tail 0 看全部", file=sys.stderr)
+        print(file=sys.stderr)
+        for i, t in enumerate(turns[start:], start + 1):
             first = t["q"].splitlines()[0] if t["q"] else ""
             mark = " " if t["a"] else "*"
             print(f"{i:3d}{mark} {fmt_ts(t['ts']):16s}  {first[:70]}")
-        if any(not t["a"] for t in turns):
-            print("\n* = 该轮还没有回答（可能是当前正在进行的一轮）", file=sys.stderr)
+        if any(not t["a"] for t in turns[start:]):
+            print("\n* = 该轮还没有回答（多半是当前正在进行的这一轮）", file=sys.stderr)
         return
 
     n = len(turns)
@@ -406,9 +418,37 @@ def main():
         if bad:
             print(f"警告: 轮次 {bad} 超出范围（共 {n} 轮），已跳过", file=sys.stderr)
     else:
-        sel = [i for i in range(n - args.last + 1, n + 1) if i >= 1]
+        # 正在进行的这一轮已经在记录里了，但还没有回答。默认从最后一个
+        # 「已完成」的轮次往回数，否则「导出最后 2 轮」会把用户刚发出的
+        # 那条「帮我导出」本身算进去。
+        end = n
+        if not args.include_pending:
+            # agent 自己调用本脚本时，用户刚发出的那条请求（「帮我导出最近两轮」）
+            # 已经在记录里了，但这一轮还没结束。两端都能从环境变量拿到自己的
+            # 会话 id，所以「读的就是自己这个会话」时，最后一轮必然是进行中的。
+            if be.current_id() and be.current_id() == sid and end > 0:
+                end -= 1
+                print(f"（已排除进行中的第 {n} 轮；要包含它加 --include-pending）",
+                      file=sys.stderr)
+            # 再往前跳过没有回答的轮次（被打断的那些，没东西可导）
+            while end > 0 and not turns[end - 1]["a"]:
+                end -= 1
+            if end == 0:
+                sys.exit("还没有已完成的轮次可以导出")
+        sel = [i for i in range(end - args.last + 1, end + 1) if i >= 1]
     if not sel:
         sys.exit("没有选中任何轮次")
+
+    def summary():
+        return "\n".join(
+            f"  {i:3d}  {fmt_ts(turns[i - 1]['ts'])}  {turns[i - 1]['q'].splitlines()[0][:60]}"
+            for i in sel
+        )
+
+    if args.dry_run:
+        print(f"将导出 {len(sel)} 轮（共 {n} 轮）到 {args.out or 'stdout'}：", file=sys.stderr)
+        print(summary())
+        return
 
     text = render(turns, sel, sid, be.label, not args.no_answer)
     if args.out:
@@ -417,7 +457,8 @@ def main():
             if fresh:
                 fh.write("# QA 记录\n\n")
             fh.write(text)
-        print(f"已把 {len(sel)} 轮追加到 {args.out}", file=sys.stderr)
+        print(f"已把 {len(sel)} 轮追加到 {args.out}：", file=sys.stderr)
+        print(summary(), file=sys.stderr)
     else:
         sys.stdout.write(text)
 
