@@ -31,8 +31,7 @@ CLAUDE_SKIP_PREFIX = ("<command-name>", "<command-message>", "<local-command-std
 # Codex 以 user 角色注入、但不是用户说的话：每轮的环境信封，和 AGENTS.md 正文
 CODEX_ENVELOPE = re.compile(
     r"^<(environment_context|user_instructions|recommended_plugins|model_switch"
-    r"|multi_agent\w*|collaboration_mode|turn_aborted|plan_mode"
-    r"|\w*_context|\w*_instructions)>"
+    r"|multi_agent\w*|collaboration_mode|turn_aborted|plan_mode)>"
     r"|^#\s*AGENTS\.md instructions\b",
     re.I,
 )
@@ -57,9 +56,11 @@ def read_jsonl(path):
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(obj, dict):  # 合法 JSON 也可能是数组或 null
+                yield obj
 
 
 def preview(text, width=70):
@@ -208,11 +209,14 @@ class CodexBackend:
         return out
 
     @staticmethod
-    def _meta(path):
-        for d in read_jsonl(path):
+    def _meta(path, scan=5):
+        """session_meta 实测总在首条，但不值得赌——往后多看几条，
+        赌输的代价是整个会话找不到。"""
+        for i, d in enumerate(read_jsonl(path)):
             if d.get("type") == "session_meta":
                 return d.get("payload") or {}
-            return None
+            if i + 1 >= scan:
+                break
         return None
 
     def current_id(self):
