@@ -326,6 +326,33 @@ def parse_sel(spec):
     return idx
 
 
+def find(turns, text, in_answers=False):
+    """返回所有提到 text 的轮次序号（1 起）。大小写不敏感的子串匹配，不是正则。"""
+    needle = text.lower()
+    hits = []
+    for i, t in enumerate(turns, 1):
+        hay = t["q"] + ("\n" + t["a"] if in_answers else "")
+        if needle in hay.lower():
+            hits.append(i)
+    return hits
+
+
+def pick_one(turns, text, in_answers, which, label):
+    """定位唯一的一轮；命中多轮时不猜，把候选列出来让人挑。"""
+    hits = find(turns, text, in_answers)
+    if not hits:
+        extra = "" if in_answers else "（回答里可能有，试试 --match-answers）"
+        sys.exit(f"{label} 没有匹配「{text}」的轮次{extra}")
+    if len(hits) > 1:
+        print(f"{label}「{text}」命中 {len(hits)} 轮，请换更精确的说法或改用 -t：",
+              file=sys.stderr)
+        for i in hits:
+            print(f"  {i:3d}  {fmt_ts(turns[i - 1]['ts'])}  "
+                  f"{turns[i - 1]['q'].splitlines()[0][:60]}", file=sys.stderr)
+        sys.exit(2)
+    return hits[which]
+
+
 def render(turns, sel, sid, label, with_answer=True):
     chunks = []
     for i in sel:
@@ -363,6 +390,14 @@ def main():
                     help="从哪个 agent 的记录里取，默认自动判断")
     ap.add_argument("--sidechain", action="store_true", help="包含子 agent 的对话")
     ap.add_argument("--all-branches", action="store_true", help="保留被改写重发废弃的旧提问")
+    ap.add_argument("--from", dest="from_", metavar="TEXT",
+                    help="从提到 TEXT 的那一轮开始，一直到最后（或 --to 指定的那轮）")
+    ap.add_argument("--to", dest="to_", metavar="TEXT",
+                    help="到提到 TEXT 的那一轮为止，需配合 --from")
+    ap.add_argument("-g", "--grep", metavar="TEXT",
+                    help="只列出提到 TEXT 的轮次，用来定位序号")
+    ap.add_argument("--match-answers", action="store_true",
+                    help="--from/--to/--grep 也在回答里找，默认只在提问里找")
     ap.add_argument("--dry-run", action="store_true",
                     help="只报告会导出哪几轮，不写文件（确认用，输出很短）")
     ap.add_argument("--include-pending", action="store_true",
@@ -395,7 +430,8 @@ def main():
     if not turns:
         sys.exit(f"{path} 里没有解析出问答")
 
-    if args.list or (args.last is None and not args.turns):
+    if args.list or (args.last is None and not args.turns and not args.from_
+                     and not args.grep):
         n = len(turns)
         start = max(0, n - args.tail) if args.tail > 0 else 0
         print(f"# [{be.label}] {path}  （共 {n} 轮）", file=sys.stderr)
@@ -411,33 +447,49 @@ def main():
         return
 
     n = len(turns)
-    if args.turns:
+
+    if args.grep:
+        hits = find(turns, args.grep, args.match_answers)
+        if not hits:
+            sys.exit(f"没有匹配「{args.grep}」的轮次")
+        print(f"共 {n} 轮，其中 {len(hits)} 轮提到「{args.grep}」：", file=sys.stderr)
+        for i in hits:
+            mark = " " if turns[i - 1]["a"] else "*"
+            print(f"{i:3d}{mark} {fmt_ts(turns[i - 1]['ts'])}  "
+                  f"{turns[i - 1]['q'].splitlines()[0][:60]}")
+        return
+
+    # 末尾要排除的轮次：进行中的这一轮，以及被打断、没有回答的那些
+    end_default, pending_note = n, None
+    if not args.include_pending:
+        if be.current_id() and be.current_id() == sid and end_default > 0:
+            end_default -= 1
+            pending_note = (f"（已排除进行中的第 {n} 轮；"
+                            f"要包含它加 --include-pending）")
+        while end_default > 0 and not turns[end_default - 1]["a"]:
+            end_default -= 1
+
+    if args.from_:
+        start = pick_one(turns, args.from_, args.match_answers, 0, "--from")
+        stop = (pick_one(turns, args.to_, args.match_answers, -1, "--to")
+                if args.to_ else end_default)
+        if stop < start:
+            sys.exit(f"--to 命中的第 {stop} 轮在 --from 的第 {start} 轮之前")
+        sel = list(range(start, stop + 1))
+    elif args.turns:
         raw = parse_sel(args.turns)
         sel = [i for i in raw if 1 <= i <= n]
         bad = [i for i in raw if i not in sel]
         if bad:
             print(f"警告: 轮次 {bad} 超出范围（共 {n} 轮），已跳过", file=sys.stderr)
     else:
-        # 正在进行的这一轮已经在记录里了，但还没有回答。默认从最后一个
-        # 「已完成」的轮次往回数，否则「导出最后 2 轮」会把用户刚发出的
-        # 那条「帮我导出」本身算进去。
-        end = n
-        if not args.include_pending:
-            # agent 自己调用本脚本时，用户刚发出的那条请求（「帮我导出最近两轮」）
-            # 已经在记录里了，但这一轮还没结束。两端都能从环境变量拿到自己的
-            # 会话 id，所以「读的就是自己这个会话」时，最后一轮必然是进行中的。
-            if be.current_id() and be.current_id() == sid and end > 0:
-                end -= 1
-                print(f"（已排除进行中的第 {n} 轮；要包含它加 --include-pending）",
-                      file=sys.stderr)
-            # 再往前跳过没有回答的轮次（被打断的那些，没东西可导）
-            while end > 0 and not turns[end - 1]["a"]:
-                end -= 1
-            if end == 0:
-                sys.exit("还没有已完成的轮次可以导出")
-        sel = [i for i in range(end - args.last + 1, end + 1) if i >= 1]
+        if end_default == 0:
+            sys.exit("还没有已完成的轮次可以导出")
+        sel = [i for i in range(end_default - args.last + 1, end_default + 1) if i >= 1]
     if not sel:
         sys.exit("没有选中任何轮次")
+    if pending_note and sel[-1] == end_default:
+        print(pending_note, file=sys.stderr)
 
     def summary():
         return "\n".join(

@@ -45,6 +45,10 @@ qa_export.py [-l] [--sessions] [-n N] [-t SPEC] [-o FILE] [-s ID]
 | `--sessions` | 列出当前目录下的所有会话（两个 agent 都扫） |
 | `-n, --last N` | 导出最后 N 轮 |
 | `-t, --turns SPEC` | 导出指定轮次，如 `3,5-7` |
+| `--from TEXT` | 从提到 TEXT 的那一轮开始，直到最后 |
+| `--to TEXT` | 到提到 TEXT 的那一轮为止，配合 `--from` |
+| `-g, --grep TEXT` | 只列出提到 TEXT 的轮次，用来定位序号 |
+| `--match-answers` | `--from`/`--to`/`-g` 也在回答里找，默认只找提问 |
 | `-o, --out FILE` | 追加写入该文件；不给则打印到 stdout |
 | `-s, --session ID` | 指定会话：id 前缀，或 Claude Code 的会话名；默认当前会话 |
 | `-a, --agent` | `claude` / `codex` / `auto`（默认） |
@@ -72,6 +76,19 @@ qa_export.py [-l] [--sessions] [-n N] [-t SPEC] [-o FILE] [-s ID]
 
 <!-- Claude Code session a1b2c3d4 turn 7 -->
 ```
+
+### 按内容划范围
+
+不必数第几轮，可以直接说「从讨论某件事开始」：
+
+```bash
+qa_export.py -g "退避"                      # 哪几轮提到它
+qa_export.py --from "退避" -o QA.md         # 从那轮到最后
+qa_export.py --from "退避" --to "限流" -o QA.md
+```
+
+子串匹配、大小写不敏感，默认只在提问里找。命中多轮时不会替你猜，
+而是把候选列出来并以退出码 2 结束。
 
 ## 记录在哪
 
