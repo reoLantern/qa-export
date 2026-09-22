@@ -62,6 +62,12 @@ def read_jsonl(path):
                 continue
 
 
+def preview(text, width=70):
+    """把提问压成一行摘要。取首行常常只拿到「我有个问题：」这种开场，
+    所以压平换行再截断，让人和 agent 都能认出这是哪一轮。"""
+    return re.sub(r"\s+", " ", text).strip()[:width]
+
+
 def new_turn(ts, text, parent=None):
     return {"ts": ts or "", "q": text, "a": [], "parent": parent}
 
@@ -348,7 +354,7 @@ def pick_one(turns, text, in_answers, which, label):
               file=sys.stderr)
         for i in hits:
             print(f"  {i:3d}  {fmt_ts(turns[i - 1]['ts'])}  "
-                  f"{turns[i - 1]['q'].splitlines()[0][:60]}", file=sys.stderr)
+                  f"{preview(turns[i - 1]['q'], 60)}", file=sys.stderr)
         sys.exit(2)
     return hits[which]
 
@@ -357,8 +363,8 @@ def render(turns, sel, sid, label, with_answer=True):
     chunks = []
     for i in sel:
         t = turns[i - 1]
-        first = t["q"].splitlines()[0]
-        body = [f"## {fmt_ts(t['ts'])} · {first[:60]}", "", "**Q**", "", t["q"]]
+        body = [f"## {fmt_ts(t['ts'])} · {preview(t['q'], 60)}", "",
+                "**Q**", "", t["q"]]
         if with_answer and t["a"]:
             body += ["", "**A**", "", t["a"]]
         body += ["", f"<!-- {label} session {str(sid)[:8]} turn {i} -->"]
@@ -439,9 +445,8 @@ def main():
             print(f"# 只显示最近 {args.tail} 轮，--tail 0 看全部", file=sys.stderr)
         print(file=sys.stderr)
         for i, t in enumerate(turns[start:], start + 1):
-            first = t["q"].splitlines()[0] if t["q"] else ""
             mark = " " if t["a"] else "*"
-            print(f"{i:3d}{mark} {fmt_ts(t['ts']):16s}  {first[:70]}")
+            print(f"{i:3d}{mark} {fmt_ts(t['ts']):16s}  {preview(t['q'])}")
         if any(not t["a"] for t in turns[start:]):
             print("\n* = 该轮还没有回答（多半是当前正在进行的这一轮）", file=sys.stderr)
         return
@@ -456,7 +461,7 @@ def main():
         for i in hits:
             mark = " " if turns[i - 1]["a"] else "*"
             print(f"{i:3d}{mark} {fmt_ts(turns[i - 1]['ts'])}  "
-                  f"{turns[i - 1]['q'].splitlines()[0][:60]}")
+                  f"{preview(turns[i - 1]['q'], 60)}")
         return
 
     # 末尾要排除的轮次：进行中的这一轮，以及被打断、没有回答的那些
@@ -493,7 +498,7 @@ def main():
 
     def summary():
         return "\n".join(
-            f"  {i:3d}  {fmt_ts(turns[i - 1]['ts'])}  {turns[i - 1]['q'].splitlines()[0][:60]}"
+            f"  {i:3d}  {fmt_ts(turns[i - 1]['ts'])}  {preview(turns[i - 1]['q'], 60)}"
             for i in sel
         )
 
