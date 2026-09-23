@@ -135,6 +135,21 @@ def abandoned_uuids(entries):
             leaf = e["leafUuid"]
     chain = walk(leaf) if leaf else set()
 
+    # last-prompt 这个锚点的写入是滞后的（实测能差几十秒）。这期间用户刚发出的
+    # 提问已经落盘、挂在锚点之后，若仍以锚点为头，它会被当成「不在链上但能走回
+    # 链上」而误判为废弃分支剪掉。所以把头推进到锚点的最新后代。
+    if chain:
+        for e in reversed(entries[-200:]):
+            if (not e.get("uuid") or e.get("isSidechain")
+                    or e.get("type") not in ("user", "assistant")):
+                continue
+            if e["uuid"] in chain:
+                break  # 最新的活跃记录就是锚点本身，无需推进
+            c = walk(e["uuid"])
+            if leaf in c:
+                chain = c
+                break
+
     if not chain:
         # 没有 leafUuid 可用时，在末尾若干候选里取链最长的那个，同样是为了
         # 躲开游离记录
