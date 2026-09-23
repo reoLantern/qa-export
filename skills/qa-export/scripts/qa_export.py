@@ -69,6 +69,102 @@ def preview(text, width=70):
     return re.sub(r"\s+", " ", text).strip()[:width]
 
 
+def _parent_of(entry, order):
+    """上一跳。compact 边界的 parentUuid 是空的，改用 logicalParentUuid 跨过去；
+    只认指向更早记录的桥，指向后面的桥会把父链绕成环。"""
+    pu = entry.get("parentUuid")
+    if pu:
+        return pu
+    lp = entry.get("logicalParentUuid")
+    if lp and order.get(lp, 1 << 60) < order.get(entry.get("uuid"), -1):
+        return lp
+    return None
+
+
+def dead_uuids(path):
+    """扫一遍文件只取图结构（uuid / 父指针 / 类型），不留正文。
+
+    整个文件读成对象列表会吃掉上百 MB——压缩过几十次的会话能到 500MB 以上，
+    所以这一遍只保留判断分支所需的几个字段，正文留给第二遍流式处理。
+    """
+    nodes = []
+    for d in read_jsonl(path):
+        if d.get("type") == "last-prompt" and d.get("leafUuid"):
+            nodes.append({"type": "last-prompt", "leafUuid": d["leafUuid"]})
+            continue
+        if not d.get("uuid"):
+            continue
+        nodes.append({
+            "uuid": d["uuid"],
+            "leafUuid": d.get("leafUuid"),
+            "parentUuid": d.get("parentUuid"),
+            "logicalParentUuid": d.get("logicalParentUuid"),
+            "type": d.get("type"),
+            "isSidechain": d.get("isSidechain"),
+        })
+    return abandoned_uuids(nodes)
+
+
+def abandoned_uuids(entries):
+    """找出被 rewind / fork 丢弃的分支。
+
+    按 Esc 改写重发留下的是「同 parentUuid 且中间没有回答」的孪生记录，好认。
+    但 rewind 丢弃的旧分支带着完整的回答，那个判据完全抓不到——所以改从结构入手：
+    从活跃叶子沿父链回溯得到当前这条分支，凡是「不在链上、但往上能走到链上」的
+    记录，就是从活跃分支分叉出去又被放弃的部分。
+
+    走不回链上的记录一律保留。那通常意味着父链被截断（compact 桥的目标已经不在
+    这个文件里），此时宁可多导出几轮，也不能让整段历史凭空消失。
+    """
+    order = {e["uuid"]: i for i, e in enumerate(entries) if e.get("uuid")}
+    byu = {e["uuid"]: e for e in entries if e.get("uuid")}
+
+    def walk(uuid):
+        chain, cur = set(), byu.get(uuid)
+        while cur is not None and cur.get("uuid") not in chain:
+            chain.add(cur["uuid"])
+            cur = byu.get(_parent_of(cur, order))
+        return chain
+
+    # 活跃叶子以 last-prompt 的 leafUuid 为准。不能直接取文件最后一条
+    # user/assistant：偶尔会有很旧的游离记录被追加到末尾，拿它当叶子会
+    # 把整条链压成几跳，然后把真正的对话全判成废弃。
+    leaf = None
+    for e in entries:
+        if e.get("type") == "last-prompt" and e.get("leafUuid") in byu:
+            leaf = e["leafUuid"]
+    chain = walk(leaf) if leaf else set()
+
+    if not chain:
+        # 没有 leafUuid 可用时，在末尾若干候选里取链最长的那个，同样是为了
+        # 躲开游离记录
+        cands = [e["uuid"] for e in entries
+                 if e.get("uuid") and e.get("type") in ("user", "assistant")
+                 and not e.get("isSidechain")][-20:]
+        for u in cands:
+            c = walk(u)
+            if len(c) > len(chain):
+                chain = c
+    if not chain:
+        return set()
+
+    status = {u: True for u in chain}
+
+    def reaches(uuid):
+        path, seen, u = [], set(), uuid
+        while u is not None and u not in status and u not in seen:
+            seen.add(u)
+            path.append(u)
+            e = byu.get(u)
+            u = _parent_of(e, order) if e else None
+        val = bool(status.get(u)) if u is not None else False
+        for node in path:
+            status[node] = val
+        return val
+
+    return {u for u in byu if u not in chain and reaches(u)}
+
+
 def new_turn(ts, text, parent=None):
     return {"ts": ts or "", "q": text, "a": [], "parent": parent}
 
@@ -103,32 +199,54 @@ class ClaudeBackend:
     def current_id(self):
         return os.environ.get("CLAUDE_CODE_SESSION_ID")
 
-    def resolve_name(self, want):
-        """会话名记在 ~/.claude/sessions/<pid>.json 里，返回 (会话 id, cwd)。
+    @staticmethod
+    def _head_info(path, cap=5000):
+        """扫文件开头，取出会话名和 cwd。两者都在前几十行里，命中即停。"""
+        title = cwd = None
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if title is None and '"custom-title"' in line:
+                    try:
+                        title = json.loads(line).get("customTitle")
+                    except json.JSONDecodeError:
+                        pass
+                if cwd is None and '"cwd"' in line:
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except json.JSONDecodeError:
+                        pass
+                if (title and cwd) or i >= cap:
+                    break
+        return title, cwd
 
-        Codex 没有这个概念，所以只有这个后端实现它。
+    def find_by_id(self, want):
+        """按会话 id 前缀在所有项目目录里找，返回 (路径, 会话 id, cwd)。"""
+        for p in sorted(glob.glob(os.path.join(self.root, "*", "*.jsonl")),
+                        key=os.path.getmtime, reverse=True):
+            sid = os.path.basename(p)[:-6]
+            if sid.startswith(want):
+                return p, sid, self._head_info(p)[1]
+        return None
+
+    def resolve_name(self, want):
+        """按会话名找会话，返回 [(mtime, 会话 id, cwd)]，新的在前。
+
+        名字有两处记录：`~/.claude/sessions/<pid>.json` 只在会话进程活着时存在，
+        而 jsonl 里的 `custom-title` 条目是持久的，所以以后者为准。
+        fork 之后会出现好几个同名会话，全部返回，由调用方决定取哪个。
+        Codex 没有会话名这个概念，所以只有这个后端实现它。
         """
-        root = os.path.join(home("CLAUDE_CONFIG_DIR", "~/.claude"), "sessions")
         exact, prefix = [], []
-        for p in glob.glob(os.path.join(root, "*.json")):
-            try:
-                with open(p, encoding="utf-8") as fh:
-                    d = json.load(fh)
-            except Exception:
+        for p in glob.glob(os.path.join(self.root, "*", "*.jsonl")):
+            title, cwd = self._head_info(p)
+            if not title:
                 continue
-            name, sid = d.get("name"), d.get("sessionId")
-            if not name or not sid:
-                continue
-            row = (d.get("startedAt") or 0, sid, d.get("cwd"))
-            if name == want:
+            row = (os.path.getmtime(p), os.path.basename(p)[:-6], cwd)
+            if title == want:
                 exact.append(row)
-            elif name.startswith(want):
+            elif title.startswith(want):
                 prefix.append(row)
-        hits = exact or prefix
-        if not hits:
-            return None
-        _, sid, cwd = max(hits, key=lambda r: r[0])
-        return sid, cwd
+        return sorted(exact or prefix, key=lambda r: -r[0])
 
     @staticmethod
     def _text(content):
@@ -147,13 +265,17 @@ class ClaudeBackend:
         )
 
     def parse(self, path, all_branches=False):
-        """按 Esc 改写重发的提问，jsonl 里留下两条 parentUuid 相同、中间没有
-        任何回答的记录，默认只保留后发的那条。
+        """默认只保留当前这条分支：rewind / fork 丢弃的旧分支整段剔除
+        （见 abandoned_uuids），按 Esc 改写重发留下的孪生提问只保留后发的那条。
+        `--all-branches` 可以全部保留。
 
         子 agent（sidechain）的对话一律不导出：本工具归档的是人与 agent 的
         问答，不是 agent 内部的协作过程。"""
+        dead = set() if all_branches else dead_uuids(path)
         turns = []
         for d in read_jsonl(path):
+            if d.get("uuid") in dead:
+                continue
             if d.get("type") not in ("user", "assistant") or d.get("isMeta"):
                 continue
             if d.get("isSidechain"):
@@ -222,6 +344,17 @@ class CodexBackend:
                 break
         return None
 
+    def find_by_id(self, want):
+        """按会话 id 前缀在所有 rollout 里找，不限 cwd。"""
+        for p in sorted(glob.glob(os.path.join(self.root, "**", "rollout-*.jsonl"),
+                                  recursive=True),
+                        key=os.path.getmtime, reverse=True):
+            meta = self._meta(p)
+            sid = (meta or {}).get("session_id") or (meta or {}).get("id") or ""
+            if sid.startswith(want) or want in os.path.basename(p):
+                return p, sid or os.path.basename(p), (meta or {}).get("cwd")
+        return None
+
     def current_id(self):
         return os.environ.get("CODEX_SESSION_ID")
 
@@ -287,9 +420,23 @@ def resolve(cwd, agent, want):
     项目目录也跟着切到那个会话的 cwd，所以不必先 cd 过去。
     """
     if want:
-        named = BACKENDS["claude"].resolve_name(want)
+        be = BACKENDS["claude"]
+        named = be.resolve_name(want)
         if named:
-            want, cwd = named[0], named[1] or cwd
+            # fork 之后同名会话可能有好几个。自己就在其中之一时用自己的，
+            # 否则不猜——列出候选让人用会话 id 指定。
+            cur = be.current_id()
+            pick = next((r for r in named if r[1] == cur), None)
+            if pick is None and len(named) > 1:
+                print(f"有 {len(named)} 个会话叫「{want}」，请改用会话 id 指定：",
+                      file=sys.stderr)
+                for mtime, sid, scwd in named:
+                    stamp = datetime.datetime.fromtimestamp(
+                        mtime).strftime("%Y-%m-%d %H:%M")
+                    print(f"  {sid[:8]}  最后活动 {stamp}  {scwd}", file=sys.stderr)
+                sys.exit(2)
+            pick = pick or named[0]
+            want, cwd = pick[1], pick[2] or cwd
     order = [agent] if agent and agent != "auto" else [detect_agent() or "", "claude", "codex"]
     tried, best = [], None
     for name in order:
@@ -305,19 +452,25 @@ def resolve(cwd, agent, want):
             if hit:
                 return be, hit[0][0], hit[0][2]
             continue
-        if agent and agent != "auto":
-            return be, found[0][0], found[0][2]
+        # 自己这个会话的记录优先，别被同目录下更活跃的别的会话抢走
         cur = be.current_id()
         if cur:
             hit = [s for s in found if s[2] == cur]
             if hit:
                 return be, hit[0][0], hit[0][2]
+        if agent and agent != "auto":
+            return be, found[0][0], found[0][2]
         if best is None or found[0][1] > best[0][1]:
             best = (found[0], be)
     if best:
         (path, _, sid), be = best
         return be, path, sid
     if want:
+        # 当前目录下没有，可能是别的项目的会话：按 id 前缀全盘兜底
+        for be in tried or [BACKENDS["claude"], BACKENDS["codex"]]:
+            hit = be.find_by_id(want)
+            if hit:
+                return be, hit[0], hit[1]
         sys.exit(f"没有找到匹配 {want!r} 的会话")
     sys.exit(f"{cwd} 下没有找到任何 Claude Code / Codex 会话记录")
 
