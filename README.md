@@ -23,6 +23,28 @@ npx skills add reoLantern/qa-export -g -a claude-code -a codex -y
 
 装好之后，直接对 agent 说「把刚才那两轮问答记进 QA.md」就行。
 
+## 仓库结构
+
+```
+skills/qa-export/
+├── SKILL.md                  # 主文档，以 Claude Code 为准
+├── references/
+│   └── codex.md              # Codex 的记录格式与已知局限
+└── scripts/
+    ├── qa_export.py          # 入口：CLI、轮次选择、渲染、输出（与 agent 无关）
+    └── backends/
+        ├── common.py         # 两个后端共用的解析原语
+        ├── claude.py         # Claude Code：分支树、rewind 剪枝、continued-in
+        └── codex.py          # Codex：线性记录，无父子指针
+```
+
+后端只负责两件事：在磁盘上找到会话文件，把文件解析成 `[{ts, q, a}]`。
+轮次怎么选、怎么渲染、怎么写出去全在入口脚本里，两边共用——所以像
+「排除进行中的那一轮」「`--dry-run`」这类行为改一次就两边生效，不会漂移。
+加一个 agent 就是加一个 `backends/<name>.py` 再登记一下。
+
+**Claude Code 一侧是优先维护的。** 两边的成熟度差异见下面的「各 agent 的状态」。
+
 ## 直接当命令行用
 
 脚本本身不依赖 agent，也不依赖任何第三方库（Python 3.8+ 即可）：
@@ -128,6 +150,20 @@ qa_export.py -s review-bot -l      # 自动切到那个会话的项目目录，�
 
 fork 之后会出现多个同名会话。此时：自己就是其中之一就用自己的，否则不猜，
 列出候选让你用会话 id 指定。`-s <id 前缀>` 也会跨项目目录查找。
+
+## 各 agent 的状态
+
+| | Claude Code | Codex |
+| --- | --- | --- |
+| 基本解析、会话定位 | 稳（本机 118 个会话全量验证） | 稳（本机 531 个 rollout 全量验证） |
+| 排除进行中的那一轮 | 稳 | 逻辑相同，未实测 |
+| rewind / 改写剪枝 | 结构性判据，全盘验证 | 只有弱判据，会漏 |
+| fork 跨文件接历史 | 有（`continued-in`，确认无损才跟） | 无（`forked_from_id` 未处理） |
+| compact 摘要过滤 | 有（`isCompactSummary`） | 无，摘要会被当成提问 |
+
+Codex 的三项缺口都源于同一件事：它的记录是纯线性追加，没有父子指针，
+Claude Code 那套沿父链回溯的办法用不了。详见
+[`skills/qa-export/references/codex.md`](skills/qa-export/references/codex.md)。
 
 ## 处理掉的坑
 
