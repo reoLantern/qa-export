@@ -219,6 +219,56 @@ class ClaudeBackend:
                     break
         return title, cwd
 
+    @staticmethod
+    def _continued_in(path):
+        """会话中途换文件时，旧文件末尾留一条 continued-in 指向后继。"""
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 64 * 1024))
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            if '"continued-in"' in line:
+                try:
+                    return json.loads(line).get("continuedInSessionId")
+                except json.JSONDecodeError:
+                    return None
+        return None
+
+    def follow(self, path, sid, depth=8):
+        """跟着 continued-in 走到最后一个文件——但只在无损时才跟。
+
+        一次会话中途换文件（换模型等）时，后继带着完整历史，不跟的话
+        `-s <旧 id>` 拿到的是截断的视图。但 continued-in 也可能指向
+        「压缩成摘要后新开的会话」，那种后继只有摘要和之后的几轮。
+
+        判据就用最直接的那个：后继必须真的包含旧文件的最后一轮、且总轮数不减。
+        不能只在后继里搜一段原文——compact 摘要会把旧对话抄进去，搜得到但
+        轮次并不在。
+        """
+        seen = {sid}
+        turns = self.parse(path)
+        for _ in range(depth):
+            nxt = self._continued_in(path)
+            if not nxt or nxt in seen:
+                break
+            cand = os.path.join(os.path.dirname(path), nxt + ".jsonl")
+            if not os.path.exists(cand):
+                break
+            try:
+                cand_turns = self.parse(cand)
+            except OSError:
+                break
+            if turns and (len(cand_turns) < len(turns)
+                          or turns[-1]["q"] not in {t["q"] for t in cand_turns}):
+                break  # 后继没带着这段历史，留在原文件
+            seen.add(nxt)
+            path, sid, turns = cand, nxt, cand_turns
+        return path, sid
+
     def find_by_id(self, want):
         """按会话 id 前缀在所有项目目录里找，返回 (路径, 会话 id, cwd)。"""
         for p in sorted(glob.glob(os.path.join(self.root, "*", "*.jsonl")),
@@ -425,6 +475,18 @@ def resolve(cwd, agent, want):
         if named:
             # fork 之后同名会话可能有好几个。自己就在其中之一时用自己的，
             # 否则不猜——列出候选让人用会话 id 指定。
+            if len(named) > 1:
+                # fork 出来的几个同名会话里，有些只是同一条血脉的前一段。
+                # 各自跟到终点再按 id 去重，剩下的才是真正不同的对话。
+                merged, seen_sid = [], set()
+                for mtime, sid, scwd in named:
+                    path = os.path.join(be.project_dir(scwd or ""), sid + ".jsonl")
+                    if os.path.exists(path):
+                        _, sid = be.follow(path, sid)
+                    if sid not in seen_sid:
+                        seen_sid.add(sid)
+                        merged.append((mtime, sid, scwd))
+                named = merged
             cur = be.current_id()
             pick = next((r for r in named if r[1] == cur), None)
             if pick is None and len(named) > 1:
@@ -437,6 +499,16 @@ def resolve(cwd, agent, want):
                 sys.exit(2)
             pick = pick or named[0]
             want, cwd = pick[1], pick[2] or cwd
+    def done(be, path, sid):
+        follow = getattr(be, "follow", None)
+        if follow:
+            newpath, newsid = follow(path, sid)
+            if newpath != path:
+                print(f"（会话 {sid[:8]} 中途换过文件，已跟到 {newsid[:8]}）",
+                      file=sys.stderr)
+            return be, newpath, newsid
+        return be, path, sid
+
     order = [agent] if agent and agent != "auto" else [detect_agent() or "", "claude", "codex"]
     tried, best = [], None
     for name in order:
@@ -450,27 +522,27 @@ def resolve(cwd, agent, want):
         if want:
             hit = [s for s in found if want in s[2] or want in os.path.basename(s[0])]
             if hit:
-                return be, hit[0][0], hit[0][2]
+                return done(be, hit[0][0], hit[0][2])
             continue
         # 自己这个会话的记录优先，别被同目录下更活跃的别的会话抢走
         cur = be.current_id()
         if cur:
             hit = [s for s in found if s[2] == cur]
             if hit:
-                return be, hit[0][0], hit[0][2]
+                return done(be, hit[0][0], hit[0][2])
         if agent and agent != "auto":
-            return be, found[0][0], found[0][2]
+            return done(be, found[0][0], found[0][2])
         if best is None or found[0][1] > best[0][1]:
             best = (found[0], be)
     if best:
         (path, _, sid), be = best
-        return be, path, sid
+        return done(be, path, sid)
     if want:
         # 当前目录下没有，可能是别的项目的会话：按 id 前缀全盘兜底
         for be in tried or [BACKENDS["claude"], BACKENDS["codex"]]:
             hit = be.find_by_id(want)
             if hit:
-                return be, hit[0], hit[1]
+                return done(be, hit[0], hit[1])
         sys.exit(f"没有找到匹配 {want!r} 的会话")
     sys.exit(f"{cwd} 下没有找到任何 Claude Code / Codex 会话记录")
 
