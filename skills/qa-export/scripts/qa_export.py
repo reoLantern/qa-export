@@ -610,13 +610,15 @@ def render(turns, sel, sid, label, with_answer=True):
     chunks = []
     for i in sel:
         t = turns[i - 1]
-        body = [f"## {fmt_ts(t['ts'])} · {preview(t['q'], 60)}", "",
+        # 轮次标题用一级：回答正文里大量使用 ## 小标题，同级会让轮次边界
+        # 在大纲里淹没掉。轮次之间再插一条 --- 分隔线。
+        body = [f"# {fmt_ts(t['ts'])} · {preview(t['q'], 60)}", "",
                 "**Q**", "", t["q"]]
         if with_answer and t["a"]:
             body += ["", "**A**", "", t["a"]]
         body += ["", f"<!-- {label} session {str(sid)[:8]} turn {i} -->"]
         chunks.append("\n".join(body))
-    return "\n\n".join(chunks) + "\n"
+    return "\n\n---\n\n".join(chunks) + "\n"
 
 
 def main():
@@ -757,8 +759,8 @@ def main():
     if args.out:
         fresh = not os.path.exists(args.out) or os.path.getsize(args.out) == 0
         with open(args.out, "a", encoding="utf-8") as fh:
-            if fresh:
-                fh.write("# QA 记录\n\n")
+            if not fresh:
+                fh.write("\n---\n\n")  # 接着已有内容写时也要隔开
             fh.write(text)
         print(f"已把 {len(sel)} 轮追加到 {args.out}：", file=sys.stderr)
         print(summary(), file=sys.stderr)
